@@ -2,7 +2,6 @@
 cache/
 out/
 broadcast/
-lib/
 
 # Node
 node_modules/
@@ -10,9 +9,15 @@ dist/
 .vite/
 .env
 .env.local
+.env.*.local
 
 # OS / editor
 .DS_Store
 *.log
 .idea/
 .vscode/
+
+# Local keys — never commit
+*.pem
+*.key
+.id_rsa*

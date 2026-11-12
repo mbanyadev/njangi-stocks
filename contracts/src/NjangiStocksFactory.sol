@@ -29,6 +29,7 @@ contract NjangiStocksFactory {
         PayoutKind payoutKind;
         address stockToken;
         uint256 stockPrice; // USDC units (same decimals as usdc) per 1e18 stock
+        int256 minReputation;
         bool started;
         bool closed;
     }
@@ -48,7 +49,9 @@ contract NjangiStocksFactory {
     int256 public constant COMPLETED = 20;
     uint256 public constant LATE_GRACE = 1; // periods after due before a payment is late
 
-    event CircleCreated(uint256 indexed id, string name, address indexed creator, PayoutKind payoutKind);
+    event CircleCreated(
+        uint256 indexed id, string name, address indexed creator, PayoutKind payoutKind, int256 minReputation
+    );
     event Joined(uint256 indexed id, address indexed member);
     event Started(uint256 indexed id, uint256 startTime);
     event Paid(uint256 indexed id, address indexed member, uint256 round, bool late);
@@ -62,8 +65,8 @@ contract NjangiStocksFactory {
     error NotStarted();
     error AlreadyStarted();
     error Closed();
-    error RoundNotReady();
     error TransferFailed();
+    error ReputationTooLow();
 
     constructor(address usdc_) {
         if (usdc_ == address(0)) revert BadArgs();
@@ -79,48 +82,72 @@ contract NjangiStocksFactory {
         return circles[id].members;
     }
 
-    function getCircle(uint256 id)
-        external
-        view
-        returns (
-            string memory name,
-            uint256 memberCount,
-            uint256 contribution,
-            uint256 period,
-            uint256 startTime,
-            uint256 currentRound,
-            PayoutKind payoutKind,
-            address stockToken,
-            uint256 stockPrice,
-            bool started,
-            bool closed
-        )
-    {
+    function isMember(uint256 id, address who) external view returns (bool) {
+        return _indexOf(circles[id].members, who) >= 0;
+    }
+
+    function hasPaid(uint256 id, address member, uint256 round) external view returns (bool) {
+        return paidRound[id][member] >= round && round != 0;
+    }
+
+    function dueAt(uint256 id, uint256 round) public view returns (uint256) {
         Circle storage c = circles[id];
-        return (
-            c.name,
-            c.members.length,
-            c.contribution,
-            c.period,
-            c.startTime,
-            c.currentRound,
-            c.payoutKind,
-            c.stockToken,
-            c.stockPrice,
-            c.started,
-            c.closed
-        );
+        if (!c.started || round == 0) return 0;
+        return c.startTime + (round * c.period);
+    }
+
+    function lateAfter(uint256 id, uint256 round) public view returns (uint256) {
+        Circle storage c = circles[id];
+        uint256 due = dueAt(id, round);
+        if (due == 0) return 0;
+        return due + (c.period * LATE_GRACE);
+    }
+
+    struct CircleView {
+        string name;
+        uint256 memberCount;
+        uint256 contribution;
+        uint256 period;
+        uint256 startTime;
+        uint256 currentRound;
+        PayoutKind payoutKind;
+        address stockToken;
+        uint256 stockPrice;
+        int256 minReputation;
+        bool started;
+        bool closed;
+    }
+
+    function getCircle(uint256 id) external view returns (CircleView memory view_) {
+        Circle storage c = circles[id];
+        view_ = CircleView({
+            name: c.name,
+            memberCount: c.members.length,
+            contribution: c.contribution,
+            period: c.period,
+            startTime: c.startTime,
+            currentRound: c.currentRound,
+            payoutKind: c.payoutKind,
+            stockToken: c.stockToken,
+            stockPrice: c.stockPrice,
+            minReputation: c.minReputation,
+            started: c.started,
+            closed: c.closed
+        });
     }
 
     /// @param stockPrice_ USDC (token units) required to mint 1e18 of the mock stock.
     ///                    Ignored when payoutKind is Usdc; pass 0.
+    /// @param minReputation_ Members must have at least this reputation to join,
+    ///                       and all listed members must meet it before the circle can start.
     function createCircle(
         string calldata name_,
         address[] calldata members_,
         uint256 contribution_,
         uint256 period_,
         PayoutKind payoutKind_,
-        uint256 stockPrice_
+        uint256 stockPrice_,
+        int256 minReputation_
     ) external returns (uint256 id) {
         if (bytes(name_).length == 0 || members_.length < 2 || contribution_ == 0 || period_ == 0) {
             revert BadArgs();
@@ -131,11 +158,7 @@ contract NjangiStocksFactory {
         id = circles.length;
         address stock;
         if (payoutKind_ == PayoutKind.Stock) {
-            MockStockToken token = new MockStockToken(
-                string.concat(name_, " Share"),
-                "nSTOCK",
-                address(this)
-            );
+            MockStockToken token = new MockStockToken(string.concat(name_, " Share"), "nSTOCK", address(this));
             stock = address(token);
         }
 
@@ -146,26 +169,33 @@ contract NjangiStocksFactory {
         c.payoutKind = payoutKind_;
         c.stockToken = stock;
         c.stockPrice = stockPrice_;
+        c.minReputation = minReputation_;
         for (uint256 i; i < members_.length; i++) {
             c.members.push(members_[i]);
         }
 
-        emit CircleCreated(id, name_, msg.sender, payoutKind_);
+        emit CircleCreated(id, name_, msg.sender, payoutKind_, minReputation_);
     }
 
     function join(uint256 id) external {
         Circle storage c = circles[id];
-        if (c.started || c.closed) revert AlreadyStarted();
+        if (c.closed) revert Closed();
+        if (c.started) revert AlreadyStarted();
         if (_indexOf(c.members, msg.sender) >= 0) revert AlreadyMember();
+        if (reputation[msg.sender] < c.minReputation) revert ReputationTooLow();
         c.members.push(msg.sender);
         emit Joined(id, msg.sender);
     }
 
     function start(uint256 id) external {
         Circle storage c = circles[id];
+        if (c.closed) revert Closed();
         if (c.started) revert AlreadyStarted();
         if (c.members.length < 2) revert BadArgs();
         if (_indexOf(c.members, msg.sender) < 0) revert NotMember();
+        for (uint256 i; i < c.members.length; i++) {
+            if (reputation[c.members[i]] < c.minReputation) revert ReputationTooLow();
+        }
         c.started = true;
         c.startTime = block.timestamp;
         c.currentRound = 1;
@@ -185,7 +215,7 @@ contract NjangiStocksFactory {
         paidRound[id][msg.sender] = round;
         collected[id][round] += c.contribution;
 
-        bool late = block.timestamp > c.startTime + (round * c.period) + (c.period * LATE_GRACE);
+        bool late = block.timestamp > lateAfter(id, round);
         int256 delta = late ? LATE : ON_TIME;
         reputation[msg.sender] += delta;
         emit ReputationChanged(msg.sender, delta, reputation[msg.sender]);
